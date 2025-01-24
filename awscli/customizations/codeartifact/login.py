@@ -10,7 +10,10 @@ from dateutil.tz import tzutc
 from dateutil.relativedelta import relativedelta
 from botocore.utils import parse_timestamp
 
-from awscli.compat import is_windows, urlparse, RawConfigParser, StringIO
+from awscli.compat import (
+    is_windows, urlparse, RawConfigParser, StringIO,
+    get_stderr_encoding, is_macos
+)
 from awscli.customizations import utils as cli_utils
 from awscli.customizations.commands import BasicCommand
 from awscli.customizations.utils import uni_print
@@ -32,6 +35,17 @@ def get_relative_expiration_time(remaining):
 
     message = " ".join(values)
     return message
+
+
+class CommandFailedError(Exception):
+    def __init__(self, called_process_error, auth_token):
+        msg = str(called_process_error).replace(auth_token, '******')
+        if called_process_error.stderr is not None:
+            msg +=(
+                f' Stderr from command:\n'
+                f'{called_process_error.stderr.decode(get_stderr_encoding())}'
+            )
+        Exception.__init__(self, msg)
 
 
 class BaseLogin(object):
@@ -78,24 +92,161 @@ class BaseLogin(object):
             return
 
         for command in commands:
-            try:
-                self.subprocess_utils.check_call(
-                    command,
-                    stdout=self.subprocess_utils.PIPE,
-                    stderr=self.subprocess_utils.PIPE,
-                )
-            except OSError as ex:
-                if ex.errno == errno.ENOENT:
-                    raise ValueError(
-                        self._TOOL_NOT_FOUND_MESSAGE % tool
-                    )
-                raise ex
+            self._run_command(tool, command)
 
         self._write_success_message(tool)
+
+    def _run_command(self, tool, command, *, ignore_errors=False):
+        try:
+            self.subprocess_utils.run(
+                command,
+                capture_output=True,
+                check=True
+            )
+        except subprocess.CalledProcessError as ex:
+            if not ignore_errors:
+                raise CommandFailedError(ex, self.auth_token)
+        except OSError as ex:
+            if ex.errno == errno.ENOENT:
+                raise ValueError(
+                    self._TOOL_NOT_FOUND_MESSAGE % tool
+                )
+            raise ex
 
     @classmethod
     def get_commands(cls, endpoint, auth_token, **kwargs):
         raise NotImplementedError('get_commands()')
+
+
+class SwiftLogin(BaseLogin):
+
+    DEFAULT_NETRC_FMT = \
+        u'machine {hostname} login token password {auth_token}'
+
+    NETRC_REGEX_FMT = \
+        r'(?P<entry_start>\bmachine\s+{escaped_hostname}\s+login\s+\S+\s+password\s+)' \
+        r'(?P<token>\S+)'
+
+    def login(self, dry_run=False):
+        scope = self.get_scope(
+            self.namespace
+        )
+        commands = self.get_commands(
+            self.repository_endpoint, self.auth_token, scope=scope
+        )
+
+        if not is_macos:
+            hostname = urlparse.urlparse(self.repository_endpoint).hostname
+            new_entry = self.DEFAULT_NETRC_FMT.format(
+                hostname=hostname,
+                auth_token=self.auth_token
+            )
+            if dry_run:
+                self._display_new_netrc_entry(new_entry, self.get_netrc_path())
+            else:
+                self._update_netrc_entry(hostname, new_entry, self.get_netrc_path())
+
+        self._run_commands('swift', commands, dry_run)
+
+    def _display_new_netrc_entry(self, new_entry, netrc_path):
+        sys.stdout.write('Dryrun mode is enabled, not writing to netrc.')
+        sys.stdout.write(os.linesep)
+        sys.stdout.write(
+            f'The following line would have been written to {netrc_path}:'
+        )
+        sys.stdout.write(os.linesep)
+        sys.stdout.write(os.linesep)
+        sys.stdout.write(new_entry)
+        sys.stdout.write(os.linesep)
+        sys.stdout.write(os.linesep)
+        sys.stdout.write('And would have run the following commands:')
+        sys.stdout.write(os.linesep)
+        sys.stdout.write(os.linesep)
+
+    def _update_netrc_entry(self, hostname, new_entry, netrc_path):
+        pattern = re.compile(
+            self.NETRC_REGEX_FMT.format(escaped_hostname=re.escape(hostname)),
+            re.M
+        )
+        if not os.path.isfile(netrc_path):
+            self._create_netrc_file(netrc_path, new_entry)
+        else:
+            with open(netrc_path, 'r') as f:
+                contents = f.read()
+            escaped_auth_token = self.auth_token.replace('\\', r'\\')
+            new_contents = re.sub(
+                pattern,
+                rf"\g<entry_start>{escaped_auth_token}",
+                contents
+            )
+
+            if new_contents == contents:
+                new_contents = self._append_netrc_entry(new_contents, new_entry)
+
+            with open(netrc_path, 'w') as f:
+                f.write(new_contents)
+
+    def _create_netrc_file(self, netrc_path, new_entry):
+        dirname = os.path.split(netrc_path)[0]
+        if not os.path.isdir(dirname):
+            os.makedirs(dirname)
+        with os.fdopen(os.open(netrc_path,
+                               os.O_WRONLY | os.O_CREAT, 0o600), 'w') as f:
+            f.write(new_entry + '\n')
+
+    def _append_netrc_entry(self, contents, new_entry):
+        if contents.endswith('\n'):
+            return contents + new_entry + '\n'
+        else:
+            return contents + '\n' + new_entry + '\n'
+
+    @classmethod
+    def get_netrc_path(cls):
+        return os.path.join(os.path.expanduser("~"), ".netrc")
+
+    @classmethod
+    def get_scope(cls, namespace):
+        # Regex for valid scope name
+        valid_scope_name = re.compile(
+            r'\A[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}\Z'
+        )
+
+        if namespace is None:
+            return namespace
+
+        if not valid_scope_name.match(namespace):
+            raise ValueError(
+                'Invalid scope name, scope must contain URL-safe '
+                'characters, no leading dots or underscores and no '
+                'more than 39 characters'
+            )
+
+        return namespace
+
+    @classmethod
+    def get_commands(cls, endpoint, auth_token, **kwargs):
+        commands = []
+        scope = kwargs.get('scope')
+
+        # Set up the codeartifact repository as the swift registry.
+        set_registry_command = [
+            'swift', 'package-registry', 'set', endpoint
+        ]
+        if scope is not None:
+            set_registry_command.extend(['--scope', scope])
+        commands.append(set_registry_command)
+
+        # Authenticate against the repository.
+        # We will write token to .netrc for Linux and Windows
+        # MacOS will store the token from command line option to Keychain
+        login_registry_command = [
+            'swift', 'package-registry', 'login', f'{endpoint}login'
+        ]
+        if is_macos:
+            login_registry_command.extend(['--token', auth_token])
+        commands.append(login_registry_command)
+
+        return commands
 
 
 class NuGetBaseLogin(BaseLogin):
@@ -110,6 +261,9 @@ class NuGetBaseLogin(BaseLogin):
     # source in whichever NuGet.Config file the source was found.
     _SOURCE_ADDED_MESSAGE = 'Added source %s to the user level NuGet.Config\n'
     _SOURCE_UPDATED_MESSAGE = 'Updated source %s in the NuGet.Config\n'
+    # Example line the below regex should match:
+    # 1.  nuget.org [Enabled]
+    _SOURCE_REGEX = re.compile(r'^\d+\.\s(?P<source_name>.+)\s\[.*\]')
 
     def login(self, dry_run=False):
         try:
@@ -144,70 +298,55 @@ class NuGetBaseLogin(BaseLogin):
             return
 
         try:
-            self.subprocess_utils.check_output(
+            self.subprocess_utils.run(
                 command,
-                stderr=self.subprocess_utils.PIPE
+                capture_output=True,
+                check=True
             )
         except subprocess.CalledProcessError as e:
             uni_print('Failed to update the NuGet.Config\n')
-            raise e
+            raise CommandFailedError(e, self.auth_token)
 
         uni_print(source_configured_message % source_name)
         self._write_success_message('nuget')
 
     def _get_source_to_url_dict(self):
-        # The response from listing sources takes the following form:
-        #
-        # Registered Sources:
-        #   1.  Source Name 1 [Enabled]
-        #       https://source1.com/index.json
-        #   2.  Source Name 2 [Disabled]
-        #       https://source2.com/index.json
-        # ...
-        #   100. Source Name 100
-        #       https://source100.com/index.json
+        """
+        Parses the output of the nuget sources list command.
 
-       # Or it can be (blank line after Registered Sources:)
+        A dict is created where the keys are the source names
+        and the values the corresponding URL.
 
-       # Registered Sources:
+        The output of the command can contain header and footer information
+        around the 'Registered Sources' section, which is ignored.
 
-       #   1.  Source Name 1 [Enabled]
-       #       https://source1.com/index.json
-       #   2.  Source Name 2 [Disabled]
-       #       https://source2.com/index.json
-       # ...
-       #   100. Source Name 100
-       #       https://source100.com/index.json
+        Example output that is parsed:
 
+        Registered Sources:
+
+        1. Source Name 1 [Enabled]
+           https://source1.com/index.json
+        2. Source Name 2 [Disabled]
+           https://source2.com/index.json
+        100. Source Name 100 [Activé]
+             https://source100.com/index.json
+        """
         response = self.subprocess_utils.check_output(
             self._get_list_command(),
             stderr=self.subprocess_utils.PIPE
         )
 
-        lines = response.decode("utf-8").splitlines()
+        lines = response.decode(os.device_encoding(1) or "utf-8").splitlines()
         lines = [line for line in lines if line.strip() != '']
 
         source_to_url_dict = {}
-        for i in range(1, len(lines), 2):
-            source_to_url_dict[self._parse_source_name(lines[i])] = \
-                self._parse_source_url(lines[i + 1])
+        for i in range(len(lines)):
+            result = self._SOURCE_REGEX.match(lines[i].strip())
+            if result:
+                source_to_url_dict[result["source_name"].strip()] = \
+                    lines[i + 1].strip()
 
         return source_to_url_dict
-
-    def _parse_source_name(self, line):
-        # A source name line takes the following form:
-        #   1.  NuGet Source [Enabled]
-
-        # Remove the Enabled/Disabled tag.
-        line_without_tag = line.strip().rsplit(' [', 1)[0]
-
-        # Remove the leading number.
-        return line_without_tag.split(None, 1)[1]
-
-    def _parse_source_url(self, line):
-        # A source url line takes the following form:
-        #       https://source.com/index.json
-        return line.strip()
 
     def _get_source_name(self, codeartifact_url, source_dict):
         default_name = '{}/{}'.format(self.domain, self.repository)
@@ -302,6 +441,10 @@ class NpmLogin(BaseLogin):
             self.repository_endpoint, self.auth_token, scope=scope
         )
         self._run_commands('npm', commands, dry_run)
+
+    def _run_command(self, tool, command):
+        ignore_errors = any('always-auth' in arg for arg in command)
+        super()._run_command(tool, command, ignore_errors=ignore_errors)
 
     @classmethod
     def get_scope(cls, namespace):
@@ -459,7 +602,7 @@ password: {auth_token}'''
                 sys.stdout.write(os.linesep)
                 raise e
         else:
-            pypi_rc.readfp(StringIO(default_pypi_rc))
+            pypi_rc.read_string(default_pypi_rc)
 
         pypi_rc_stream = StringIO()
         pypi_rc.write(pypi_rc_stream)
@@ -502,6 +645,11 @@ class CodeArtifactLogin(BasicCommand):
     '''Log in to the idiomatic tool for the requested package format.'''
 
     TOOL_MAP = {
+        'swift': {
+            'package_format': 'swift',
+            'login_cls': SwiftLogin,
+            'namespace_support': True,
+        },
         'nuget': {
             'package_format': 'nuget',
             'login_cls': NuGetLogin,
@@ -573,11 +721,17 @@ class CodeArtifactLogin(BasicCommand):
             'required': True,
         },
         {
+            'name': 'endpoint-type',
+            'help_text': 'The type of endpoint you want the tool to interact with',
+            'required': False
+        },
+        {
             'name': 'dry-run',
             'action': 'store_true',
             'help_text': 'Only print the commands that would be executed '
                          'to connect your tool with your repository without '
-                         'making any changes to your configuration',
+                         'making any changes to your configuration. Note that '
+                         'this prints the unredacted auth token as part of the output',
             'required': False,
             'default': False
         },
@@ -601,6 +755,8 @@ class CodeArtifactLogin(BasicCommand):
             'repository': parsed_args.repository,
             'format': package_format
         }
+        if parsed_args.endpoint_type:
+            kwargs['endpointType'] = parsed_args.endpoint_type
         if parsed_args.domain_owner:
             kwargs['domainOwner'] = parsed_args.domain_owner
 

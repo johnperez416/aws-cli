@@ -18,11 +18,11 @@ import zipfile
 from botocore.session import get_session
 from botocore.exceptions import ClientError
 
-from awscli.compat import six
 from awscli.testutils import unittest, mock, FileCreator
 from awscli.customizations.gamelift.uploadbuild import UploadBuildCommand
 from awscli.customizations.gamelift.uploadbuild import zip_directory
 from awscli.customizations.gamelift.uploadbuild import validate_directory
+from awscli.compat import StringIO
 
 
 class TestGetGameSessionLogCommand(unittest.TestCase):
@@ -142,7 +142,7 @@ class TestGetGameSessionLogCommand(unittest.TestCase):
             OperatingSystem=operating_system)
 
     def test_error_message_when_directory_is_empty(self):
-        with mock.patch('sys.stderr', six.StringIO()) as mock_stderr:
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr:
             self.cmd(self.args, self.global_args)
             self.assertEqual(
                 mock_stderr.getvalue(),
@@ -158,7 +158,7 @@ class TestGetGameSessionLogCommand(unittest.TestCase):
             '--build-root', ''
         ]
 
-        with mock.patch('sys.stderr', six.StringIO()) as mock_stderr:
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr:
             self.cmd(self.args, self.global_args)
             self.assertEqual(
                 mock_stderr.getvalue(),
@@ -175,7 +175,7 @@ class TestGetGameSessionLogCommand(unittest.TestCase):
             '--build-root', dir_not_exist
         ]
 
-        with mock.patch('sys.stderr', six.StringIO()) as mock_stderr:
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr:
             self.cmd(self.args, self.global_args)
             self.assertEqual(
                 mock_stderr.getvalue(),
@@ -193,6 +193,21 @@ class TestGetGameSessionLogCommand(unittest.TestCase):
             tempfile_path = self.upload_file_mock.call_args[0][0]
             # Make sure the temporary file is removed.
             self.assertFalse(os.path.exists(tempfile_path))
+
+    def test_upload_build_when_server_sdk_version_is_provided(self):
+        server_sdk_version = '4.0.2'
+        self.file_creator.create_file('tmpfile', 'Some contents')
+        self.args = [
+            '--name', self.build_name, '--build-version', self.build_version,
+            '--build-root', self.build_root,
+            '--server-sdk-version', server_sdk_version
+        ]
+        self.cmd(self.args, self.global_args)
+
+        # Ensure the GameLift client was called correctly.
+        self.gamelift_client.create_build.assert_called_once_with(
+            Name=self.build_name, Version=self.build_version,
+            ServerSdkVersion=server_sdk_version)
 
 
 class TestZipDirectory(unittest.TestCase):
