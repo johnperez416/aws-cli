@@ -283,7 +283,8 @@ DEBUGGING = (
     ' which allows you to browse log files using the Amazon EMR console.'
     ' Turning debugging on requires that you specify <code>--log-uri</code>'
     ' because log files must be stored in Amazon S3 so that'
-    ' Amazon EMR can index them for viewing in the console.</p>')
+    ' Amazon EMR can index them for viewing in the console.'
+    ' Effective January 23, 2023, Amazon EMR will discontinue the debugging tool for all versions.</p>')
 
 TAGS = (
     '<p>A list of tags to associate with a cluster, which apply to'
@@ -366,6 +367,17 @@ EBS_ROOT_VOLUME_SIZE = (
     '<p>This option is available only with Amazon EMR version 4.x and later. Specifies the size,'
     ' in GiB, of the EBS root device volume of the Amazon Linux AMI'
     ' that is used for each EC2 instance in the cluster. </p>')
+
+EBS_ROOT_VOLUME_IOPS = (
+    '<p>This option is available only with Amazon EMR version 6.15.0 and later. Specifies the IOPS,'
+    ' of the EBS root device volume of the Amazon Linux AMI'
+    ' that is used for each EC2 instance in the cluster. </p>')
+
+EBS_ROOT_VOLUME_THROUGHPUT = (
+    '<p>This option is available only with Amazon EMR version 6.15.0 and later. Specifies the throughput,'
+    ' in MiB/s, of the EBS root device volume of the Amazon Linux AMI'
+    ' that is used for each EC2 instance in the cluster. </p>')
+
 
 SECURITY_CONFIG = (
     '<p>Specifies the name of a security configuration to use for the cluster.'
@@ -505,4 +517,8 @@ EXECUTION_ROLE_ARN = (
     '<p>You must grant the execution role the permissions needed '
     'to access the same IAM resources that the step can access. '
     'The execution role can be a cross-account IAM Role.</p> '
+)
+
+UNHEALTHY_NODE_REPLACEMENT = (
+    '<p>Unhealthy node replacement for an Amazon EMR cluster.</p> '
 )
